@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+langserve
+langgraph
+langgraph-prebuilt
+langchain-core
+langchain-google-genai
+requests
+sse-starlette
