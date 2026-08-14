@@ -3,7 +3,7 @@ Travel Planner Agent — FastAPI + LangServe deployment
 Deploy target: Render (or any host that runs `uvicorn app:app`)
 
 Env vars required (set these in Render's dashboard, NOT in code):
-    GOOGLE_API_KEY   -> your Gemini API key from https://aistudio.google.com/apikey
+    GOOGLE_APIKEY   -> your Gemini API key from https://aistudio.google.com/apikey
 """
 
 import os
@@ -23,12 +23,16 @@ from langserve import add_routes
 # 1. API key — read from environment (Render injects this from your dashboard
 #    settings, it should NEVER be hardcoded in this file)
 # ---------------------------------------------------------------------------
-api_key = os.environ.get("GOOGLE_API_KEY")
+# reads your Render env var named GOOGLE_APIKEY
+api_key = os.environ.get("GOOGLE_APIKEY")
 if not api_key:
     raise RuntimeError(
-        "GOOGLE_API_KEY environment variable is not set. "
+        "GOOGLE_APIKEY environment variable is not set. "
         "Add it under Render > your service > Environment."
     )
+
+# but LangChain's Gemini wrapper specifically looks for GOOGLE_API_KEY
+os.environ["GOOGLE_API_KEY"] = api_key
 
 llm = ChatGoogleGenerativeAI(model="gemini-flash-latest", temperature=0.3)
 
