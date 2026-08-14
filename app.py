@@ -1,24 +1,26 @@
 """
 Travel Planner Agent — FastAPI + LangServe deployment
 Deploy target: Render (or any host that runs `uvicorn app:app`)
- 
+
 Env vars required (set these in Render's dashboard, NOT in code):
     GOOGLE_APIKEY   -> your Gemini API key from https://aistudio.google.com/apikey
 """
- 
+
 import os
 import json
 import random
 import re
 from datetime import datetime, timedelta
- 
+
 import requests
 from fastapi import FastAPI
 from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.prebuilt import create_react_agent
 from langserve import add_routes
- 
+from langchain_core.messages import HumanMessage
+from pydantic import BaseModel
+
 # ---------------------------------------------------------------------------
 # 1. API key — read from environment (Render injects this from your dashboard
 #    settings, it should NEVER be hardcoded in this file)
@@ -30,18 +32,18 @@ if not api_key:
         "GOOGLE_APIKEY environment variable is not set. "
         "Add it under Render > your service > Environment."
     )
- 
+
 # but LangChain's Gemini wrapper specifically looks for GOOGLE_API_KEY
 os.environ["GOOGLE_API_KEY"] = api_key
- 
+
 llm = ChatGoogleGenerativeAI(
     model="gemini-flash-latest",
     temperature=0.3,
     max_retries=6,       # auto-retry on transient 503/overload errors
     timeout=60,          # fail fast instead of hanging indefinitely
 )
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # 2. Tools
 # ---------------------------------------------------------------------------
@@ -58,14 +60,14 @@ def weather_check(city: str, date: str) -> dict:
         )
         if geo_resp.status_code != 200:
             return {"error": f"Geocoding API returned status {geo_resp.status_code} for '{city}'"}
- 
+
         geo = geo_resp.json()
         if not geo.get("results"):
             return {"error": f"Could not find location: {city}"}
- 
+
         lat = geo["results"][0]["latitude"]
         lon = geo["results"][0]["longitude"]
- 
+
         forecast_resp = requests.get(
             "https://api.open-meteo.com/v1/forecast",
             params={
@@ -80,12 +82,12 @@ def weather_check(city: str, date: str) -> dict:
         )
         if forecast_resp.status_code != 200:
             return {"error": f"Forecast API returned status {forecast_resp.status_code}"}
- 
+
         forecast = forecast_resp.json()
         daily = forecast.get("daily", {})
         if not daily.get("time"):
             return {"city": city, "date": date, "note": "Forecast unavailable this far out, assume seasonal average."}
- 
+
         result = {
             "city": city,
             "date": date,
@@ -95,15 +97,15 @@ def weather_check(city: str, date: str) -> dict:
         }
         print(f"[weather_check] done: {result}", flush=True)
         return result
- 
+
     except requests.exceptions.RequestException as e:
         print(f"[weather_check] network error: {e}", flush=True)
         return {"error": f"Network error while checking weather: {e}"}
     except (KeyError, IndexError, ValueError) as e:
         print(f"[weather_check] format error: {e}", flush=True)
         return {"error": f"Unexpected response format from weather API: {e}"}
- 
- 
+
+
 @tool
 def flight_price_search(origin: str, destination: str, depart_date: str, return_date: str) -> dict:
     """Estimate round-trip flight price between two cities for given dates.
@@ -113,7 +115,7 @@ def flight_price_search(origin: str, destination: str, depart_date: str, return_
     seed = sum(ord(c) for c in (origin + destination + depart_date))
     random.seed(seed)
     base_price = random.randint(250, 900)
- 
+
     result = {
         "origin": origin,
         "destination": destination,
@@ -124,8 +126,8 @@ def flight_price_search(origin: str, destination: str, depart_date: str, return_
     }
     print(f"[flight_price_search] done: {result}", flush=True)
     return result
- 
- 
+
+
 @tool
 def attraction_finder(city: str, max_results: int = 6) -> list:
     """Find popular tourist attractions in a city using Wikipedia search.
@@ -145,28 +147,28 @@ def attraction_finder(city: str, max_results: int = 6) -> list:
         )
         if resp.status_code != 200:
             return [{"error": f"Wikipedia API returned status {resp.status_code}"}]
- 
+
         search = resp.json()
         results = []
         for item in search.get("query", {}).get("search", []):
             snippet = re.sub("<.*?>", "", item.get("snippet", ""))
             results.append({"name": item["title"], "description": snippet})
- 
+
         if not results:
             print(f"[attraction_finder] no results for {city}", flush=True)
             return [{"error": f"No attractions found for '{city}'"}]
- 
+
         print(f"[attraction_finder] done: {len(results)} results", flush=True)
         return results
- 
+
     except requests.exceptions.RequestException as e:
         print(f"[attraction_finder] network error: {e}", flush=True)
         return [{"error": f"Network error while finding attractions: {e}"}]
     except (KeyError, ValueError) as e:
         print(f"[attraction_finder] format error: {e}", flush=True)
         return [{"error": f"Unexpected response format from Wikipedia API: {e}"}]
- 
- 
+
+
 @tool
 def itinerary_builder(destination: str, start_date: str, num_days: int,
                        attractions: list, budget_usd: float) -> dict:
@@ -174,13 +176,13 @@ def itinerary_builder(destination: str, start_date: str, num_days: int,
     attractions can be a list of dicts with 'name' and 'description', OR a list
     of plain strings (attraction names). Returns a structured itinerary."""
     print(f"[itinerary_builder] called: destination={destination}, num_days={num_days}", flush=True)
- 
+
     if isinstance(attractions, str):
         try:
             attractions = json.loads(attractions)
         except json.JSONDecodeError:
             attractions = [attractions]
- 
+
     normalized = []
     for a in attractions:
         if isinstance(a, dict):
@@ -190,21 +192,21 @@ def itinerary_builder(destination: str, start_date: str, num_days: int,
             })
         elif isinstance(a, str):
             normalized.append({"name": a, "description": ""})
- 
+
     if not normalized:
         normalized = [{"name": f"Explore {destination}", "description": ""}]
- 
+
     start = datetime.strptime(start_date, "%Y-%m-%d")
     days = []
- 
+
     per_day = max(1, len(normalized) // max(1, num_days))
     idx = 0
- 
+
     for d in range(num_days):
         date = (start + timedelta(days=d)).strftime("%Y-%m-%d")
         day_stops = normalized[idx: idx + per_day] or normalized[:1]
         idx += per_day
- 
+
         stops = [
             {
                 "name": a["name"],
@@ -214,7 +216,7 @@ def itinerary_builder(destination: str, start_date: str, num_days: int,
             for i, a in enumerate(day_stops)
         ]
         days.append({"day_label": f"Day {d+1} ({date})", "stops": stops})
- 
+
     result = {
         "title": f"{num_days}-Day Trip to {destination}",
         "budget_usd": budget_usd,
@@ -222,8 +224,8 @@ def itinerary_builder(destination: str, start_date: str, num_days: int,
     }
     print(f"[itinerary_builder] done: {len(days)} days built", flush=True)
     return result
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # 3. Agent
 # ---------------------------------------------------------------------------
@@ -235,14 +237,14 @@ Given a destination, travel dates, and budget, you must:
 4. Use itinerary_builder to assemble a day-by-day plan.
 Always call itinerary_builder LAST, after gathering the other data.
 Present the final itinerary clearly, including weather and flight cost context."""
- 
+
 agent = create_react_agent(
     model=llm,
     tools=[weather_check, flight_price_search, attraction_finder, itinerary_builder],
     prompt=system_prompt,
 )
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # 4. FastAPI app + LangServe route
 #    Once deployed, this exposes:
@@ -256,24 +258,45 @@ app = FastAPI(
     version="1.0",
     description="Agent that builds a day-by-day travel itinerary given destination, dates, and budget.",
 )
- 
+
 add_routes(app, agent, path="/travel-planner")
- 
+
 print("[startup] Travel Planner Agent initialized and routes mounted.", flush=True)
- 
- 
+
+
+class PlanRequest(BaseModel):
+    query: str
+
+
+@app.post("/plan")
+def plan_trip(req: PlanRequest):
+    """Simple, reliable endpoint — bypasses the LangServe playground's
+    message auto-conversion, which currently errors with
+    'Got unsupported message type' due to a langchain-core/langgraph
+    version mismatch on this deployment.
+
+    Test this directly at /docs (Swagger UI) with a POST body like:
+        {"query": "Plan a 4-day trip to Tokyo..."}
+    """
+    print(f"[/plan] received query: {req.query}", flush=True)
+    result = agent.invoke({"messages": [HumanMessage(content=req.query)]})
+    final_message = result["messages"][-1]
+    print(f"[/plan] done, returning final answer", flush=True)
+    return {"answer": final_message.content}
+
+
 @app.get("/")
 def root():
     return {
         "status": "ok",
         "message": "Travel Planner Agent is live.",
-        "playground": "/travel-planner/playground/",
+        "recommended_endpoint": "POST /plan with body {\"query\": \"...\"} — use /docs to try it",
+        "playground": "/travel-planner/playground/ (currently broken — message conversion bug)",
         "docs": "/docs",
     }
- 
- 
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 10000))
     uvicorn.run(app, host="0.0.0.0", port=port)
- 
