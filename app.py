@@ -1,410 +1,329 @@
-"""
-Travel Planner Agent — FastAPI + LangServe deployment
-Deploy target: Render (or any host that runs `uvicorn app:app`)
- 
-Env vars required (set these in Render's dashboard, NOT in code):
-    GOOGLE_APIKEY   -> your Gemini API key from https://aistudio.google.com/apikey
-"""
- 
 import os
-import json
-import random
-import re
-from datetime import datetime, timedelta
- 
+import io
 import requests
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
+from pypdf import PdfReader
 from langchain_core.tools import tool
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langgraph.prebuilt import create_react_agent
-from langserve import add_routes
 from langchain_core.messages import HumanMessage
-from pydantic import BaseModel
+from langchain_core.runnables import RunnableLambda
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_community.tools import DuckDuckGoSearchResults
+from langchain.agents import create_agent
+from langserve import add_routes
  
-# ---------------------------------------------------------------------------
-# 1. API key — read from environment (Render injects this from your dashboard
-#    settings, it should NEVER be hardcoded in this file)
-# ---------------------------------------------------------------------------
-# reads your Render env var named GOOGLE_APIKEY
-api_key = os.environ.get("GOOGLE_APIKEY")
-if not api_key:
-    raise RuntimeError(
-        "GOOGLE_APIKEY environment variable is not set. "
-        "Add it under Render > your service > Environment."
-    )
- 
-# but LangChain's Gemini wrapper specifically looks for GOOGLE_API_KEY
-os.environ["GOOGLE_API_KEY"] = api_key
+# --- 1. LLM ---
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+if not GOOGLE_API_KEY:
+    raise RuntimeError("GOOGLE_API_KEY environment variable is not set on this server.")
  
 llm = ChatGoogleGenerativeAI(
-    model="gemini-flash-latest",
+    model="gemini-3.6-flash",
+    google_api_key=GOOGLE_API_KEY,
     temperature=0.3,
-    max_retries=6,       # auto-retry on transient 503/overload errors
-    timeout=60,          # fail fast instead of hanging indefinitely
 )
  
+search_engine = DuckDuckGoSearchResults()
  
-# ---------------------------------------------------------------------------
-# 2. Tools
-# ---------------------------------------------------------------------------
+# --- 2. Tools ---
 @tool
-def weather_check(city: str, date: str) -> dict:
-    """Get the weather forecast for a city on a specific date (format YYYY-MM-DD).
-    Returns max/min temperature (C) and chance of rain."""
-    print(f"[weather_check] called: city={city}, date={date}", flush=True)
+def job_search(role: str) -> str:
+    """Search the web for current job openings matching a given role."""
+    query = f"{role} job openings India 2026"
+    return search_engine.invoke(query)
+ 
+ 
+@tool
+def skill_gap_analysis(role: str, resume_text: str) -> str:
+    """Compare the student's resume skills against the requirements of a target role and list missing skills."""
+    prompt = (
+        f"You are a technical recruiter. Given this resume text:\n{resume_text}\n\n"
+        f"And the target role: '{role}'\n\n"
+        f"List the skills the candidate already has, and the skills they are missing "
+        f"for this role. Be concise and use bullet points."
+    )
+    response = llm.invoke(prompt)
+    return response.content if hasattr(response, "content") else str(response)
+ 
+ 
+@tool
+def project_ideas(missing_skills: str) -> str:
+    """Suggest 3 practical project ideas to help a student build the given missing skills."""
+    prompt = (
+        f"Suggest 3 practical, resume-worthy project ideas that would help a student "
+        f"learn and demonstrate these missing skills: {missing_skills}. "
+        f"For each, give a one-line description."
+    )
+    response = llm.invoke(prompt)
+    return response.content if hasattr(response, "content") else str(response)
+ 
+ 
+@tool
+def github_check(github_username: str) -> str:
+    """Check a student's GitHub profile for recent public repo activity and languages used."""
+    url = f"https://api.github.com/users/{github_username}/repos?sort=updated&per_page=5"
     try:
-        geo_resp = requests.get(
-            "https://geocoding-api.open-meteo.com/v1/search",
-            params={"name": city, "count": 1},
-            timeout=10,
-        )
-        if geo_resp.status_code != 200:
-            return {"error": f"Geocoding API returned status {geo_resp.status_code} for '{city}'"}
- 
-        geo = geo_resp.json()
-        if not geo.get("results"):
-            return {"error": f"Could not find location: {city}"}
- 
-        lat = geo["results"][0]["latitude"]
-        lon = geo["results"][0]["longitude"]
- 
-        forecast_resp = requests.get(
-            "https://api.open-meteo.com/v1/forecast",
-            params={
-                "latitude": lat,
-                "longitude": lon,
-                "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max",
-                "timezone": "auto",
-                "start_date": date,
-                "end_date": date,
-            },
-            timeout=10,
-        )
-        if forecast_resp.status_code != 200:
-            return {"error": f"Forecast API returned status {forecast_resp.status_code}"}
- 
-        forecast = forecast_resp.json()
-        daily = forecast.get("daily", {})
-        if not daily.get("time"):
-            return {"city": city, "date": date, "note": "Forecast unavailable this far out, assume seasonal average."}
- 
-        result = {
-            "city": city,
-            "date": date,
-            "temp_max_c": daily["temperature_2m_max"][0],
-            "temp_min_c": daily["temperature_2m_min"][0],
-            "rain_chance_pct": daily["precipitation_probability_max"][0],
-        }
-        print(f"[weather_check] done: {result}", flush=True)
-        return result
- 
-    except requests.exceptions.RequestException as e:
-        print(f"[weather_check] network error: {e}", flush=True)
-        return {"error": f"Network error while checking weather: {e}"}
-    except (KeyError, IndexError, ValueError) as e:
-        print(f"[weather_check] format error: {e}", flush=True)
-        return {"error": f"Unexpected response format from weather API: {e}"}
+        response = requests.get(url, timeout=10)
+    except requests.RequestException as e:
+        return f"GitHub request failed: {e}"
+    if response.status_code == 404:
+        return f"GitHub user '{github_username}' not found."
+    if response.status_code == 403:
+        return "GitHub API rate limit reached, try again later."
+    if response.status_code != 200:
+        return f"Could not fetch GitHub data for user: {github_username}"
+    repos = response.json()
+    summary = [
+        f"{repo['name']} (lang: {repo.get('language', 'N/A')}, updated: {repo['updated_at'][:10]})"
+        for repo in repos
+    ]
+    return "Recent repos: " + "; ".join(summary) if summary else "No public repos found."
  
  
-@tool
-def flight_price_search(origin: str, destination: str, depart_date: str, return_date: str) -> dict:
-    """Estimate round-trip flight price between two cities for given dates.
-    Returns an estimated price in USD. This is a MOCK — replace with a real
-    flight API (Amadeus/Skyscanner) for production use."""
-    print(f"[flight_price_search] called: {origin} -> {destination}", flush=True)
-    seed = sum(ord(c) for c in (origin + destination + depart_date))
-    random.seed(seed)
-    base_price = random.randint(250, 900)
+tools = [job_search, skill_gap_analysis, project_ideas, github_check]
  
-    result = {
-        "origin": origin,
-        "destination": destination,
-        "depart_date": depart_date,
-        "return_date": return_date,
-        "estimated_price_usd": base_price,
-        "note": "Mock estimate — connect a real flight API for live pricing.",
-    }
-    print(f"[flight_price_search] done: {result}", flush=True)
-    return result
- 
- 
-@tool
-def attraction_finder(city: str, max_results: int = 6) -> list:
-    """Find popular tourist attractions in a city using Wikipedia search.
-    Returns a list of attraction names with short descriptions."""
-    print(f"[attraction_finder] called: city={city}", flush=True)
-    try:
-        resp = requests.get(
-            "https://en.wikipedia.org/w/api.php",
-            params={
-                "action": "query",
-                "list": "search",
-                "srsearch": f"tourist attractions in {city}",
-                "format": "json",
-                "srlimit": max_results,
-            },
-            timeout=10,
-        )
-        if resp.status_code != 200:
-            return [{"error": f"Wikipedia API returned status {resp.status_code}"}]
- 
-        search = resp.json()
-        results = []
-        for item in search.get("query", {}).get("search", []):
-            snippet = re.sub("<.*?>", "", item.get("snippet", ""))
-            results.append({"name": item["title"], "description": snippet})
- 
-        if not results:
-            print(f"[attraction_finder] no results for {city}", flush=True)
-            return [{"error": f"No attractions found for '{city}'"}]
- 
-        print(f"[attraction_finder] done: {len(results)} results", flush=True)
-        return results
- 
-    except requests.exceptions.RequestException as e:
-        print(f"[attraction_finder] network error: {e}", flush=True)
-        return [{"error": f"Network error while finding attractions: {e}"}]
-    except (KeyError, ValueError) as e:
-        print(f"[attraction_finder] format error: {e}", flush=True)
-        return [{"error": f"Unexpected response format from Wikipedia API: {e}"}]
- 
- 
-@tool
-def itinerary_builder(destination: str, start_date: str, num_days: int,
-                       attractions: list, budget_usd: float) -> dict:
-    """Build a day-by-day itinerary by distributing attractions across the trip days.
-    attractions can be a list of dicts with 'name' and 'description', OR a list
-    of plain strings (attraction names). Returns a structured itinerary."""
-    print(f"[itinerary_builder] called: destination={destination}, num_days={num_days}", flush=True)
- 
-    if isinstance(attractions, str):
-        try:
-            attractions = json.loads(attractions)
-        except json.JSONDecodeError:
-            attractions = [attractions]
- 
-    normalized = []
-    for a in attractions:
-        if isinstance(a, dict):
-            normalized.append({
-                "name": a.get("name", "Unnamed attraction"),
-                "description": a.get("description", ""),
-            })
-        elif isinstance(a, str):
-            normalized.append({"name": a, "description": ""})
- 
-    if not normalized:
-        normalized = [{"name": f"Explore {destination}", "description": ""}]
- 
-    start = datetime.strptime(start_date, "%Y-%m-%d")
-    days = []
- 
-    per_day = max(1, len(normalized) // max(1, num_days))
-    idx = 0
- 
-    for d in range(num_days):
-        date = (start + timedelta(days=d)).strftime("%Y-%m-%d")
-        day_stops = normalized[idx: idx + per_day] or normalized[:1]
-        idx += per_day
- 
-        stops = [
-            {
-                "name": a["name"],
-                "time": "Morning" if i == 0 else "Afternoon",
-                "blurb": a["description"][:120] if a["description"] else "",
-            }
-            for i, a in enumerate(day_stops)
-        ]
-        days.append({"day_label": f"Day {d+1} ({date})", "stops": stops})
- 
-    result = {
-        "title": f"{num_days}-Day Trip to {destination}",
-        "budget_usd": budget_usd,
-        "days": days,
-    }
-    print(f"[itinerary_builder] done: {len(days)} days built", flush=True)
-    return result
- 
- 
-# ---------------------------------------------------------------------------
-# 3. Agent
-# ---------------------------------------------------------------------------
-system_prompt = """You are a Travel Planner Agent.
-Given a destination, travel dates, and budget, you must:
-1. Check the weather for the destination on the trip dates.
-2. Search for flight price estimates.
-3. Find real attractions in the destination.
-4. Use itinerary_builder to assemble a day-by-day plan.
-Always call itinerary_builder LAST, after gathering the other data.
-Present the final itinerary clearly, including weather and flight cost context."""
- 
-agent = create_react_agent(
+career_agent = create_agent(
     model=llm,
-    tools=[weather_check, flight_price_search, attraction_finder, itinerary_builder],
-    prompt=system_prompt,
+    tools=tools,
+    system_prompt=(
+        "You are a Placement-Ready AI Career Agent for engineering students. "
+        "Given a student's resume, target role, and GitHub username, use the available "
+        "tools to: 1) find matching job openings, 2) identify skill gaps, "
+        "3) suggest relevant projects, and 4) check their GitHub activity. "
+        "Call multiple tools as needed before giving your final answer. "
+        "End with a clear, structured summary."
+    ),
 )
  
  
-# ---------------------------------------------------------------------------
-# 4. FastAPI app + LangServe route
-#    Once deployed, this exposes:
-#      /travel-planner/invoke      -> POST, single request/response
-#      /travel-planner/stream      -> POST, streamed response
-#      /travel-planner/playground/ -> interactive browser UI
-#      /docs                       -> auto-generated API docs
-# ---------------------------------------------------------------------------
-app = FastAPI(
-    title="Travel Planner Agent",
-    version="1.0",
-    description="Agent that builds a day-by-day travel itinerary given destination, dates, and budget.",
-)
- 
-add_routes(app, agent, path="/travel-planner")
- 
-print("[startup] Travel Planner Agent initialized and routes mounted.", flush=True)
+# --- 3. Shared schema + helpers ---
+class CareerAgentInput(BaseModel):
+    resume_text: str = Field(..., description="Full text extracted from the student's resume PDF")
+    target_role: str = Field(..., description="Role the student is targeting, e.g. 'Machine Learning Engineer'")
+    github_username: str = Field(..., description="Student's GitHub username")
  
  
-class PlanRequest(BaseModel):
-    query: str
+def extract_final_text(agent_result: dict) -> str:
+    for msg in reversed(agent_result.get("messages", [])):
+        if msg.__class__.__name__ != "AIMessage":
+            continue
+        content = getattr(msg, "content", "")
+        if isinstance(content, str) and content.strip():
+            return content
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text" and block.get("text", "").strip():
+                    return block["text"]
+    return ""
  
  
-@app.post("/plan")
-def plan_trip(req: PlanRequest):
-    """Simple, reliable endpoint — bypasses the LangServe playground's
-    message auto-conversion, which currently errors with
-    'Got unsupported message type' due to a langchain-core/langgraph
-    version mismatch on this deployment.
-    """
-    print(f"[/plan] received query: {req.query}", flush=True)
-    result = agent.invoke({"messages": [HumanMessage(content=req.query)]})
-    final_message = result["messages"][-1]
+def run_career_agent(payload: CareerAgentInput) -> dict:
+    query = (
+        f"My target role is '{payload.target_role}'. "
+        f"My GitHub username is '{payload.github_username}'. "
+        f"Here is my resume:\n{payload.resume_text}\n\n"
+        f"Please find job openings, analyze my skill gaps, suggest projects, "
+        f"and check my GitHub activity."
+    )
+    result = career_agent.invoke({"messages": [HumanMessage(content=query)]})
+    tool_calls_made = [
+        tc["name"]
+        for msg in result["messages"]
+        if hasattr(msg, "tool_calls") and msg.tool_calls
+        for tc in msg.tool_calls
+    ]
+    return {
+        "student_role": payload.target_role,
+        "github_username": payload.github_username,
+        "tools_used": tool_calls_made,
+        "final_summary": extract_final_text(result),
+    }
  
-    # Gemini sometimes returns content as a string, sometimes as a list of
-    # structured content blocks (e.g. [{"type": "text", "text": "..."}]).
-    # Normalize to plain text either way.
-    content = final_message.content
-    if isinstance(content, list):
-        text = "\n".join(
-            block.get("text", "") if isinstance(block, dict) else str(block)
-            for block in content
+ 
+career_chain = RunnableLambda(run_career_agent)
+ 
+# --- 4. FastAPI app ---
+app = FastAPI(title="Placement-Ready AI Career Agent")
+ 
+add_routes(app, career_chain, path="/career-agent", playground_type="default")
+ 
+ 
+# --- 5. PDF upload route ---
+@app.post("/career-agent/upload")
+async def career_agent_upload(
+    resume_pdf: UploadFile = File(..., description="Student's resume as a PDF file"),
+    target_role: str = Form(...),
+    github_username: str = Form(...),
+):
+    try:
+        if resume_pdf.content_type != "application/pdf":
+            raise HTTPException(status_code=400, detail="resume_pdf must be a PDF file")
+ 
+        pdf_bytes = await resume_pdf.read()
+ 
+        try:
+            reader = PdfReader(io.BytesIO(pdf_bytes))
+            resume_text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not read PDF: {e}")
+ 
+        if not resume_text.strip():
+            raise HTTPException(status_code=400, detail="No extractable text found in PDF")
+ 
+        payload = CareerAgentInput(
+            resume_text=resume_text,
+            target_role=target_role,
+            github_username=github_username,
         )
-    else:
-        text = content
  
-    print(f"[/plan] done, returning final answer", flush=True)
-    return {"answer": text}
+        return run_career_agent(payload)
+ 
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
  
  
-FRONTEND_HTML = """
+# --- 6. Homepage with a direct PDF-upload form + formatted results ---
+HOMEPAGE_HTML = """
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Travel Planner Agent</title>
-<style>
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-         max-width: 720px; margin: 40px auto; padding: 0 20px; background: #f7f7f8; color: #1a1a1a; }
-  h1 { font-size: 1.6rem; margin-bottom: 4px; }
-  p.sub { color: #666; margin-top: 0; }
-  .card { background: white; border-radius: 12px; padding: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); margin-bottom: 20px; }
-  label { display: block; font-weight: 600; margin-top: 14px; margin-bottom: 4px; font-size: 0.9rem; }
-  input { width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 8px; font-size: 0.95rem; box-sizing: border-box; }
-  button { margin-top: 20px; width: 100%; padding: 12px; background: #2563eb; color: white; border: none;
-           border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer; }
-  button:disabled { background: #9ab3ea; cursor: not-allowed; }
-  #result { white-space: pre-wrap; line-height: 1.5; font-size: 0.95rem; }
-  #status { color: #666; font-size: 0.9rem; margin-top: 10px; }
-  .row { display: flex; gap: 12px; }
-  .row > div { flex: 1; }
-</style>
+  <meta charset="utf-8" />
+  <title>Placement-Ready AI Career Agent</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.2/marked.min.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 680px; margin: 40px auto; padding: 0 16px; color: #1a1a1a; }
+    h1 { font-size: 1.4rem; }
+    label { display: block; margin-top: 16px; font-weight: 600; font-size: 0.9rem; }
+    input[type=text], input[type=file] {
+      width: 100%; padding: 8px; margin-top: 6px; box-sizing: border-box;
+      border: 1px solid #ccc; border-radius: 6px; font-size: 0.95rem;
+    }
+    button {
+      margin-top: 20px; padding: 10px 20px; border: none; border-radius: 6px;
+      background: #4f46e5; color: white; font-size: 0.95rem; cursor: pointer;
+    }
+    button:disabled { background: #a5a5a5; cursor: not-allowed; }
+    #status { margin-top: 16px; font-size: 0.9rem; color: #555; }
+ 
+    #resultBox { display: none; margin-top: 24px; }
+    .meta-row {
+      display: flex; gap: 24px; flex-wrap: wrap; margin-bottom: 16px;
+      font-size: 0.85rem; color: #444;
+    }
+    .meta-row div span { display: block; font-weight: 600; color: #111; }
+    .tools-used { margin-bottom: 20px; }
+    .tools-used span {
+      display: inline-block; background: #eef2ff; color: #4338ca;
+      padding: 3px 10px; border-radius: 999px; font-size: 0.78rem;
+      margin-right: 6px; margin-bottom: 6px;
+    }
+    #summaryOut {
+      background: #fafafa; border: 1px solid #eee; border-radius: 8px;
+      padding: 18px 20px; font-size: 0.92rem; line-height: 1.55;
+    }
+    #summaryOut h1, #summaryOut h2, #summaryOut h3 { margin-top: 1.2em; margin-bottom: 0.4em; }
+    #summaryOut ul { padding-left: 1.2em; }
+    #summaryOut table { border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 0.85rem; }
+    #summaryOut th, #summaryOut td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; }
+  </style>
 </head>
 <body>
-  <h1>✈️ Travel Planner Agent</h1>
-  <p class="sub">Enter your trip details and get a full day-by-day itinerary.</p>
+  <h1>&#127891; Placement-Ready AI Career Agent</h1>
+  <p>Upload your resume PDF, tell it your target role and GitHub username, and it'll search jobs, find skill gaps, suggest projects, and check your GitHub activity.</p>
  
-  <div class="card">
-    <label>Destination</label>
-    <input id="destination" value="Tokyo, Japan">
+  <form id="agentForm">
+    <label for="resume_pdf">Resume (PDF)</label>
+    <input type="file" id="resume_pdf" name="resume_pdf" accept="application/pdf" required />
  
-    <label>Departing from</label>
-    <input id="origin" value="Hyderabad, India">
+    <label for="target_role">Target Role</label>
+    <input type="text" id="target_role" name="target_role" placeholder="e.g. Machine Learning Engineer" required />
  
-    <div class="row">
-      <div>
-        <label>Start date</label>
-        <input id="startDate" type="date" value="2026-09-10">
-      </div>
-      <div>
-        <label>Return date</label>
-        <input id="endDate" type="date" value="2026-09-14">
-      </div>
+    <label for="github_username">GitHub Username</label>
+    <input type="text" id="github_username" name="github_username" placeholder="e.g. octocat" required />
+ 
+    <button type="submit" id="submitBtn">Run Career Agent</button>
+  </form>
+ 
+  <div id="status"></div>
+ 
+  <div id="resultBox">
+    <div class="meta-row">
+      <div>Target Role<span id="roleOut"></span></div>
+      <div>GitHub<span id="ghOut"></span></div>
     </div>
- 
-    <label>Budget (USD)</label>
-    <input id="budget" value="1500">
- 
-    <button id="planBtn" onclick="planTrip()">Plan My Trip</button>
-    <div id="status"></div>
+    <div class="tools-used" id="toolsOut"></div>
+    <div id="summaryOut"></div>
   </div>
  
-  <div class="card" id="resultCard" style="display:none;">
-    <div id="result"></div>
-  </div>
+  <script>
+    const form = document.getElementById("agentForm");
+    const statusEl = document.getElementById("status");
+    const resultBox = document.getElementById("resultBox");
+    const roleOut = document.getElementById("roleOut");
+    const ghOut = document.getElementById("ghOut");
+    const toolsOut = document.getElementById("toolsOut");
+    const summaryOut = document.getElementById("summaryOut");
+    const submitBtn = document.getElementById("submitBtn");
  
-<script>
-async function planTrip() {
-  const destination = document.getElementById('destination').value;
-  const origin = document.getElementById('origin').value;
-  const startDate = document.getElementById('startDate').value;
-  const endDate = document.getElementById('endDate').value;
-  const budget = document.getElementById('budget').value;
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      resultBox.style.display = "none";
+      submitBtn.disabled = true;
+      statusEl.textContent = "Running agent... this can take 20-60 seconds.";
  
-  const query = `Plan a trip to ${destination}, departing from ${origin}, starting ${startDate} and returning ${endDate}. My budget is $${budget} total.`;
+      const formData = new FormData();
+      formData.append("resume_pdf", document.getElementById("resume_pdf").files[0]);
+      formData.append("target_role", document.getElementById("target_role").value);
+      formData.append("github_username", document.getElementById("github_username").value);
  
-  const btn = document.getElementById('planBtn');
-  const status = document.getElementById('status');
-  const resultCard = document.getElementById('resultCard');
-  const result = document.getElementById('result');
+      try {
+        const res = await fetch("/career-agent/upload", { method: "POST", body: formData });
+        const contentType = res.headers.get("content-type") || "";
+        if (!contentType.includes("application/json")) {
+          const text = await res.text();
+          statusEl.textContent = "Server error (status " + res.status + "): " + text.slice(0, 200);
+          return;
+        }
+        const data = await res.json();
+        if (!res.ok) {
+          statusEl.textContent = "Error: " + (data.detail || res.statusText);
+        } else {
+          statusEl.textContent = "Done.";
+          resultBox.style.display = "block";
  
-  btn.disabled = true;
-  status.textContent = 'Planning your trip... this can take 20-40 seconds.';
-  resultCard.style.display = 'none';
+          roleOut.textContent = data.student_role || "";
+          ghOut.textContent = data.github_username || "";
  
-  try {
-    const resp = await fetch('/plan', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query })
+          toolsOut.innerHTML = "";
+          (data.tools_used || []).forEach(t => {
+            const el = document.createElement("span");
+            el.textContent = t;
+            toolsOut.appendChild(el);
+          });
+ 
+          summaryOut.innerHTML = marked.parse(data.final_summary || "(no summary returned)");
+        }
+      } catch (err) {
+        statusEl.textContent = "Request failed: " + err;
+      } finally {
+        submitBtn.disabled = false;
+      }
     });
-    const data = await resp.json();
- 
-    if (!resp.ok) {
-      status.textContent = 'Error: ' + (data.detail ? JSON.stringify(data.detail) : resp.status);
-    } else {
-      status.textContent = '';
-      result.textContent = data.answer;
-      resultCard.style.display = 'block';
-    }
-  } catch (err) {
-    status.textContent = 'Request failed: ' + err.message;
-  } finally {
-    btn.disabled = false;
-  }
-}
-</script>
+  </script>
 </body>
 </html>
 """
  
- 
 @app.get("/", response_class=HTMLResponse)
-def root():
-    return FRONTEND_HTML
+async def homepage():
+    return HOMEPAGE_HTML
  
  
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 10000))
+    port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+ 
