@@ -10,6 +10,7 @@ import os
 import json
 import random
 import re
+import concurrent.futures
 from datetime import datetime, timedelta
  
 import requests
@@ -31,12 +32,20 @@ if not GOOGLE_API_KEY:
         "Add it under Render > your service > Environment."
     )
  
+# max_retries kept low — each retry adds latency, and Render's proxy will
+# kill slow requests with a 502 before Google's own retries would help.
 llm = ChatGoogleGenerativeAI(
     model="gemini-flash-latest",
     google_api_key=GOOGLE_API_KEY,
     temperature=0.3,
-    max_retries=6,
+    max_retries=2,
 )
+ 
+# Overall wall-clock budget for one full agent run. Render's free-tier proxy
+# times out around ~30-60s and returns its own 502 page (not JSON) if we're
+# still running — so we self-cancel first and return a clean JSON error
+# instead of letting Render kill the connection.
+AGENT_TIME_BUDGET_SECONDS = 45
  
  
 # ---------------------------------------------------------------------------
@@ -50,7 +59,7 @@ def weather_check(city: str, date: str) -> dict:
         geo_resp = requests.get(
             "https://geocoding-api.open-meteo.com/v1/search",
             params={"name": city, "count": 1},
-            timeout=10,
+            timeout=6,
         )
         if geo_resp.status_code != 200:
             return {"error": f"Geocoding API returned status {geo_resp.status_code} for '{city}'"}
@@ -72,7 +81,7 @@ def weather_check(city: str, date: str) -> dict:
                 "start_date": date,
                 "end_date": date,
             },
-            timeout=10,
+            timeout=6,
         )
         if forecast_resp.status_code != 200:
             return {"error": f"Forecast API returned status {forecast_resp.status_code}"}
@@ -129,7 +138,7 @@ def attraction_finder(city: str, max_results: int = 6) -> list:
                 "format": "json",
                 "srlimit": max_results,
             },
-            timeout=10,
+            timeout=6,
         )
         if resp.status_code != 200:
             return [{"error": f"Wikipedia API returned status {resp.status_code}"}]
@@ -211,13 +220,14 @@ tools = [weather_check, flight_price_search, attraction_finder, itinerary_builde
 # 3. Agent
 # ---------------------------------------------------------------------------
 system_prompt = """You are a Travel Planner Agent.
-Given a destination, travel dates, and budget, you must:
-1. Check the weather for the destination on the trip dates.
-2. Search for flight price estimates.
-3. Find real attractions in the destination.
-4. Use itinerary_builder to assemble a day-by-day plan.
-Always call itinerary_builder LAST, after gathering the other data.
-Present the final itinerary clearly, including weather and flight cost context."""
+Given a destination, travel dates, and budget, call EACH tool EXACTLY ONCE,
+in this order, with no repeats and no extra reasoning steps in between:
+1. weather_check — once, for the destination and start date only.
+2. flight_price_search — once.
+3. attraction_finder — once, with max_results=4.
+4. itinerary_builder — once, last, using the attractions you already found.
+Then immediately present the final itinerary in your answer. Do not call any
+tool more than once, and do not re-check anything."""
  
 agent = create_react_agent(
     model=llm,
@@ -262,6 +272,15 @@ def extract_itinerary_json(agent_result: dict):
     return None
  
  
+def _invoke_agent(user_request: str) -> dict:
+    # recursion_limit caps total agent steps (tool calls + reasoning turns)
+    # so a confused model can't loop forever and blow the time budget.
+    return agent.invoke(
+        {"messages": [{"role": "user", "content": user_request}]},
+        config={"recursion_limit": 12},
+    )
+ 
+ 
 def run_trip_planner(payload: TripRequest) -> dict:
     start = datetime.strptime(payload.start_date, "%Y-%m-%d")
     end = datetime.strptime(payload.return_date, "%Y-%m-%d")
@@ -273,7 +292,22 @@ def run_trip_planner(payload: TripRequest) -> dict:
         f"My total budget is ${payload.budget_usd}."
     )
  
-    result = agent.invoke({"messages": [{"role": "user", "content": user_request}]})
+    # Run the agent with a hard wall-clock budget. If it's still running past
+    # this, we cancel and return a clean JSON error ourselves — rather than
+    # letting Render's own proxy kill the connection and return an HTML 502
+    # page (which is what was breaking the frontend's res.json() call).
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_invoke_agent, user_request)
+        try:
+            result = future.result(timeout=AGENT_TIME_BUDGET_SECONDS)
+        except concurrent.futures.TimeoutError:
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    "The trip planner took too long to respond. "
+                    "Try again — it usually finishes faster on a retry."
+                ),
+            )
  
     return {
         "destination": payload.destination,
@@ -300,6 +334,8 @@ app = FastAPI(
 async def plan_trip(req: TripRequest):
     try:
         return run_trip_planner(req)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Trip planning failed: {e}")
  
@@ -443,3 +479,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 10000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+ 
