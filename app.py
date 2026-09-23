@@ -35,7 +35,7 @@ if not GOOGLE_API_KEY:
 # max_retries kept low — each retry adds latency, and Render's proxy will
 # kill slow requests with a 502 before Google's own retries would help.
 llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
+    model="gemini-3.6-flash",
     google_api_key=GOOGLE_API_KEY,
     temperature=0.3,
     max_retries=2,
